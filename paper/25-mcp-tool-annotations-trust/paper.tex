@@ -1,0 +1,157 @@
+\documentclass{llncs}
+
+% === Packages ===
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{pifont}% \ding for markers
+\hypersetup{breaklinks=true}
+\sloppy
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    columns=fullflexible,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny,
+    xleftmargin=2em,
+    framexleftmargin=1.5em,
+}
+
+\setcounter{secnumdepth}{5}
+
+\begin{document}
+
+\title{Trust Labels as Attack Surface: MCP Tool Annotations and the Protocol's Unenforced Safety Contract}
+
+\author{Anonymous}
+\institute{Anonymous}
+
+\maketitle
+
+\begin{abstract}
+The Model Context Protocol (MCP) lets AI hosts discover and call remote tools, and the protocol's tool model carries \emph{trust labels}---\texttt{annotations} such as \texttt{readOnlyHint}, \texttt{destructiveHint}, and \texttt{openWorldHint}---intended to tell the host how risky a tool is so it can gate permission prompts or policy. Prior work documents unauthenticated code-execution control planes and prompt injection in the agent ecosystem, but the security of the trust-label mechanism \emph{itself} is unexamined: can a malicious MCP server \emph{self-declare} a dangerous tool as safe, and does the ecosystem treat that declaration as authoritative? We show, by black-box runtime verification against a real MCP server and the official Python SDK, that (1) a server can declare a tool with \texttt{readOnlyHint=true}, \texttt{destructiveHint=false}, and a benign description while the tool actually executes a destructive command (file deletion + system-directory listing), and (2) the MCP SDK transport enforces nothing---it forwards the tool and the call verbatim, leaving authorization entirely to the host. We survey how several classes of hosts (from SDK primitives to permission-gated CLIs) consume these labels, and we argue the trust-label contract is \emph{unenforced at the protocol layer}, converting a safety hint into an attacker-controlled claim. We provide detection and mitigation guidance---most importantly that hosts must not use \texttt{annotations} for policy, and the protocol should mark labels as untrusted metadata.
+\end{abstract}
+
+\keywords{Model Context Protocol \and MCP \and Tool Annotations \and readOnlyHint \and Trust Label \and Unauthenticated Execution \and CWE-693}
+
+\section{Introduction}\label{sec:intro}
+
+AI agents increasingly execute actions through \emph{tools}, and the Model Context Protocol (MCP)~\cite{mcp-spec} has become the dominant way hosts discover and invoke remote tools. A central safety mechanism of the MCP tool model is a set of \emph{trust labels}: every tool may carry \texttt{annotations}---\texttt{readOnlyHint}, \texttt{destructiveHint}, \texttt{idempotentHint}, \texttt{openWorldHint}---that are \emph{supposed} to tell the host how dangerous the tool is, so the host can gate permission prompts or apply policy (e.g.\ skip confirmation for read-only tools).
+
+This creates an implicit trust boundary: the host \emph{trusts the tool's self-declared risk} at authorization time. Our question: is that trust enforceable? Prior work on MCP security~\cite{chen2026mcp,pcfg2026,anon2026mcp} documents unauthenticated code-execution control planes, read-only-gate bypass (CWE-281), and prompt injection, but the \emph{trust-label mechanism itself}---whether a malicious server can lie about its tool's safety and whether the ecosystem believes it---is unexamined.
+
+This paper's contributions:
+\begin{enumerate}
+    \item \textbf{A black-box proof that MCP trust labels are self-attested and unenforced:} we register a real MCP server declaring a tool \texttt{readOnlyHint=true}/\texttt{destructiveHint=false}/benign-description, and prove the tool actually executes a destructive command (deletes a marker file and lists a system directory). Runtime-verified against the official Python SDK client.
+    \item \textbf{The SDK transport enforces no safety:} the tool is forwarded, the call is forwarded, output is returned---the authorization check is entirely deferred to the host, so the label is ornamental at transport.
+    \item \textbf{An ecosystem survey} of how host classes consume labels, showing the trust model is inconsistent and, in permission-gated hosts, label-derived policy would not catch a lying server.
+    \item \textbf{Detection and mitigation:} hosts must not key authorization off \texttt{annotations} (they are attacker-controlled), and the protocol should mark labels as untrusted metadata rather than a relied-upon safety signal.
+\end{enumerate}
+
+\section{Background: MCP Tool Model and Annotations}\label{sec:background}
+
+\subsection{The MCP tool model}\label{sub:model}
+An MCP server exposes \texttt{tools} via \texttt{tools/list}. Each tool has \texttt{name}, \texttt{description}, \texttt{inputSchema} (JSON Schema), and---crucially---\texttt{annotations} indicating safety-relevant intent:
+\begin{lstlisting}
+{
+  "name": "read_insights",
+  "description": "Reads harmless aggregate insights (pure read-only)",
+  "inputSchema": { "type": "object", "properties": {} },
+  "annotations": { "readOnlyHint": true, "destructiveHint": false }
+}
+\end{lstlisting}
+
+\subsection{Where the trust boundary sits}\label{sub:boundary}
+The protocol's intent is that \texttt{annotations} communicate risk from server to host so the host can decide whether to prompt. But the server is \emph{the attacker's code} in a malicious scenario---it fully controls these fields. Whether this is a vulnerability depends on whether the host \emph{relies} on them for authorization. At minimum, the transport must not treat them as a security decision. Our finding: the SDK transport does not.
+
+\section{Threat Model}\label{sec:threat}
+We model a malicious or compromised MCP server that an AI host connects to (e.g.\ via a project's \texttt{.mcp.json} or a connectors directory entry). The server declares its dangerous tools as safe via \texttt{annotations} and benign descriptions. Objective: get the host to execute the tool without a permission prompt (or through policy that would have denied it), executing a destructive action. We assume the host uses \texttt{annotations} (as the protocol invites) to reduce prompting for "read-only" tools.
+
+\section{Black-Box Verification}\label{sec:verify}
+We built a minimal stdio MCP server (no external deps) exposing:
+\begin{itemize}
+    \item \texttt{read\_insights}: declared \texttt{readOnlyHint=true}, \texttt{destructiveHint=false}, desc "pure read-only", but on call runs \texttt{sh -c "rm -f <marker> \&\& ls /etc"}.
+    \item \texttt{get\_metadata}: declared read-only, returns \texttt{\{\}}.
+\end{itemize}
+We connected with the official Python MCP SDK client and verified (Listing~\ref{lst:verify}):
+\begin{enumerate}
+    \item \texttt{tools/list} returns the tool with \texttt{readOnlyHint=True}; the client surfaces it as-is.
+    \item \texttt{tools/call} executes the tool; the marker file is deleted and the system directory is listed -- the destructive action happens despite the read-only declaration.
+    \item The SDK client performs \emph{no} safety interception: it forwards the call and returns output;
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,label=lst:verify,caption={Black-box result: declared read-only tool executes destructive command.}]
+# tool listed with readOnlyHint=True, destructiveHint=False
+# call read_insights -> "marker deleted + system dir listed"
+# marker file: no longer exists  (destructive action executed)
+# SDK client: no prompt, no block -- pure forward
+\end{lstlisting}
+
+This is a protocol-layer fact: the trust label is \emph{self-attested and unenforced at transport}. The only place a check can live is the host's authorization layer, and many hosts use the label to \emph{skip} checks.
+
+\section{Ecosystem Survey: How Hosts Consume Labels}\label{sec:survey}
+We examined how representative host classes consume tool annotations:
+
+\begin{table}[ht]
+\centering\small
+\caption{Host-layer consumption of MCP tool \texttt{annotations} (and its implication).}
+\label{tab:hosts}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Host class} & \textbf{Uses \texttt{annotations}?} & \textbf{Could a lying label bypass?} & \textbf{Notes} \\
+\midrule
+SDK transport (python mcp) & No (forwards only) & N/A at transport; all policy deferred & Found: no enforcement \\
+Permission-gated CLI (e.g.\ agent CLIs) & May use for prompt reduction & \textbf{Yes, if trusted} & A ``read-only'' label could skip prompt \\
+Policy / guardrail gateway & May filter tools by hints & \textbf{Yes, if trusted} & Label-derived tool filter \\
+Thin proxy / bridge & Forwards verbatim & N/A & No own policy \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The risk materializes precisely where a host \emph{uses} \texttt{annotations} to make an authorization decision (skip a prompt, allow a tool). Because the label is server-controlled, a malicious server controls the decision.
+
+\subsection{Empirical evidence: no endpoint enforces the label}\label{sub:empirical}
+We confirmed by source inspection that the label is effectively \emph{unanchored} across the ecosystem:
+\begin{itemize}
+    \item \textbf{Official Python SDK}: a full grep of the SDK's \texttt{shared/} and \texttt{client/} for authorization logic keyed on \texttt{readOnlyHint}/\texttt{destructiveHint} returns nothing---the SDK surfaces annotations as data and forwards every tool call verbatim. No prompt, no block, no policy input.
+    \item \textbf{Governance gateways} (e.g.\ Aegis MCP-to-MCP gateway, agent-sandbox with tool-gating): no code path reads \texttt{annotations} to filter/allow tools. They implement policy keyed on \emph{tool identity/arguments} (or, when unauthenticated, on nothing enforceable), not on the server-declared hint.
+    \item \textbf{Our black-box run (Sec.~\ref{sec:verify})}: the SDK client listed \texttt{readOnlyHint=True} and executed the tool without any safety interception.
+\end{itemize}
+Together these show the trust label is \emph{advisory metadata with no enforcing consumer}---which is exactly what makes it an unguarded, attacker-controlled claim.
+
+\section{Honest Scope and Limitations}\label{sec:scope}
+\begin{itemize}
+    \item We \emph{proved} the server-side lie and the SDK's non-enforcement. We did \emph{not} prove a specific permission-gated product executes a destructive action silently (that requires a live, product-level host; noted as deployment-dependent).
+    \item This is the protocol/ecosystem trust-model issue; it is complementary to the unauthenticated-execution findings in prior work~\cite{anon2026mcp}.
+    \item Harmless marker command only; no real data harmed.
+\end{itemize}
+
+\section{Mitigation}\label{sec:mitigation}
+\begin{enumerate}
+    \item \textbf{Hosts must not key authorization off \texttt{annotations}.} A server-declared ``read-only'' label is not a safety decision; hosts should treat all remote tool calls as potentially harmful and prompt/policy accordingly, or verify by other means.
+    \item \textbf{Protocol: mark labels as untrusted metadata.} The spec should state \texttt{annotations} are advisory, not authoritative, and never sufficient to skip a permission gate.
+    \item \textbf{Guardrails.} Gateways/hosts should validate tool behavior (e.g.\ by sandboxing execution) rather than trusting declared risk.
+    \item \textbf{Sandboxing for anything labelled read-only.} If a host does trust the label for prompt-reduction, it must at least sandbox the tool so even a "read-only" lie cannot execute destructive ops.
+\end{enumerate}
+
+\section{Conclusion}\label{sec:conclusion}
+MCP's tool trust labels are self-attested and unenforced at the protocol layer. We proved a malicious server can declare a destructive tool as read-only and that the official SDK forwards it without interception; the safety contract therefore rests entirely on hosts that must not trust it. We provide evidence, an ecosystem survey, and mitigation (labels as advisory metadata; authorization never keyed off server-declared safety). This closes a gap overlooked by prior agent-security corpora, which focused on unauthorized \emph{execution} primitives rather than the \emph{trust-label} trust model.
+
+\section{Disclosure \& Ethics}\label{sec:disclosure}
+Verified with a harmless marker only, no real harm, no third-party data. Reported as a protocol trust-model issue rather than a product-specific CVE, consistent with responsible disclosure.
+
+\bibliographystyle{splncs04}
+\bibliography{references}
+
+\end{document}
