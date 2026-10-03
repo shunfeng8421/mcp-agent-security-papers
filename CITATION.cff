@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite as:"
+title: "MCP / Agent Security Research Papers (runtime-verified)"
+authors:
+  - family-names: Chen
+    given-names: Shiqiang
+    orcid: ""
+keywords:
+  - MCP security
+  - AI agent security
+  - prompt injection
+  - tool annotations
+license: CC-BY-4.0
