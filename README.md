@@ -17,6 +17,14 @@ Runtime-verified security research on the MCP (Model Context Protocol) and AI-ag
 - Trust-label contract is self-attested and unenforced - advisory metadata with no enforcing consumer
 - `paper/25-mcp-tool-annotations-trust/`
 
+
+### Paper #26 - Zero-Star Trust Inversion
+**Title:** *Name-Based Assurance in the AI-Agent Execution Control Plane*
+- Systematic runtime-verified audit of 62 freshly-published repos in the agent-execution-control class
+- 4 confirmed unauthenticated vulnerabilities, all named for the property they violate (gateway/sandbox/policy)
+- Control group of 7 hardened implementations proves the pattern is avoidable
+- `paper/26-zero-star-trust-inversion/`
+
 ## Prior work (Zenodo DOIs)
 - **#16** MCP Ecosystem Security - DOI 10.5281/zenodo.22942676 (20 vulns / 17 repos)
 - **#23** Credential-Theft and Identity Forgery in MCP/A2A - DOI 10.5281/zenodo.22973907
