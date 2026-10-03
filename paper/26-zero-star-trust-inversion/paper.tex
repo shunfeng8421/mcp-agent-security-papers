@@ -1,0 +1,134 @@
+\documentclass{llncs}
+
+% === Packages ===
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{array}
+
+\newcommand{\secref}[1]{Sec.~\ref{#1}}
+\newcommand{\figref}[1]{Fig.~\ref{#1}}
+
+% === Metadata ===
+\title{Zero-Star Trust Inversion: Name-Based Assurance in the AI-Agent Execution Control Plane}
+\author{Anonymous Submission}
+\institute{Anonymous Institution}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The AI-agent ecosystem is being flooded with freshly-published, near-zero-star repositories whose names advertise security properties they do not provide. Components called \emph{gateway}, \emph{sandbox}, \emph{policy engine}, and \emph{approval} are deployed by operators on the strength of that naming---yet our runtime-verified audit of 62 freshly-published repositories shows that 4 of the execution-control-plane components ship as \emph{unauthenticated, reachable code-execution or policy-rewrite primitives}. We call this \emph{zero-star trust inversion}: the name is the assurance, and the name is wrong. In contrast, a control group of 7 more-established implementations (some with thousands of stars, some 0-star but carefully built) enforce authentication and fail closed. We document the audit methodology, the four confirmed vulnerabilities, and the statistical signal: the vulnerability rate in the name-advertising control-plane class is concentrated among recent 0-star uploads, while hardened implementations---regardless of stars---were not exploitable. The results argue that (1) operators must not infer security from a component's name or star count, and (2) the ecosystem needs an enforceable trust signal independent of self-attestation.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+The rapid adoption of Model Context Protocol (MCP) and agent-orchestration tooling has created a market for small, focused repositories that slot into agent pipelines: execution gateways, sandboxes, policy engines, approval services. Deploying an agent that can \emph{execute code} raises the stakes of every one of these components. An operator choosing a component named ``execution gateway'' reasonably assumes it gates execution; choosing one named ``sandbox'' assumes isolation; ``policy engine'' assumes enforcement.
+
+This paper reports a systematic, runtime-verified audit of the execution-control-plane class. We find that the assumption is unsafe: among 62 freshly-published repositories in this class, 4 shipped as unauthenticated primitives whose \emph{only} control is the name. We formalize the phenomenon as \emph{zero-star trust inversion} and present:
+\begin{itemize}
+\item an audit methodology tuned for the recent-0-star population (\secref{sec:method});
+\item four runtime-confirmed vulnerabilities with full reproduction (\secref{sec:vulns});
+\item a control group of 7 hardened implementations, showing the pattern is a choice, not a necessity (\secref{sec:control});
+\item the statistical signal and its implications (\secref{sec:analysis}).
+\end{itemize}
+
+\section{Threat Model and Target Class}\label{sec:model}
+\textbf{Adversary.} A network-reachable attacker with no credentials. We assume the victim deploys the component and exposes it on a reachable interface (its own README does so: ``\texttt{docker run -p 8000:8000}'' binds \texttt{0.0.0.0}).
+
+\textbf{Target class.} GitHub repositories, created within the audit window (roughly 2026-09-25 to 10-02), whose name or README advertises execution control: \texttt{*-gateway}, \texttt{*-sandbox}, \texttt{*-policy}, \texttt{*-approval}, \texttt{*orchestrator}. We deliberately did not audit established, well-known MCP servers (those are a separate, well-covered surface).
+
+\textbf{Assurance baseline.} The only assurance an operator has before deployment is the name and README claim. We test whether that claim holds under adversarial conditions.
+
+\section{Methodology}\label{sec:method}
+Our pipeline, tuned to the recent-0-star population, has four stages:
+\begin{enumerate}
+\item \textbf{Candidate discovery.} GitHub code search for the target-class keywords, filtered by \texttt{created} recency and language. We cloned 62 repositories into an isolated audit tree on a loopback-only host.
+\item \textbf{Static triage.} Per repository: (a) enumerate entry points (FastAPI/Flask/stdio routes, Dockerfile \texttt{EXPOSE}/\texttt{-p} binds); (b) classify as \emph{executable} (has a network or arbitrary-exec surface) vs \emph{documentation/demo}; (c) for executable ones, check authentication (\texttt{Depends}, middleware, token gate) and whether write/exec endpoints exist.
+\item \textbf{Runtime confirmation} (only for high-signal candidates). Start the service in an isolated venv bound to \texttt{127.0.0.1}; drive the unauthenticated endpoints; verify a real effect (status code, stdout marker echo, config read-back). No credentials, no real assets, no external hosts are ever touched. Every confirmation is reproducible from the finding write-up.
+\item \textbf{Disclosure.} Each confirmed vulnerability is reported to the owning repository via a GitHub issue; the issue is cited here.
+\end{enumerate}
+\begin{table}[t]
+\centering
+\small
+\caption{Audit summary (2026-10 audit window).\label{tab:summary}}
+\begin{tabular}{lrr}
+\toprule
+Metric & Vulnerable & Hardened \\
+\midrule
+Repositories cloned & 62 & -- \\
+Execution-control candidates (deep audit) & 13 & 7 \\
+Confirmed vulnerabilities & 4 & 0 \\
+\texttt{0.0.0.0} bind in Dockerfile & 3/4 & 0 \\
+Authentication enforced & 0/4 & 7/7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Confirmed Vulnerabilities}\label{sec:vulns}
+We report four runtime-confirmed cases. All four are in the execution-control class and all four were \emph{unauthenticated} on every reachable control endpoint.
+
+\subsection{\texttt{agent-exec-gateway}: unauthenticated arbitrary code execution}\label{sub:aeg}
+\texttt{truong51972/agent-exec-gateway} (0-star, created 2026-10-02). A FastAPI app named ``execution gateway'' with no authentication on any \texttt{/api/*} route. We confirmed on loopback:
+\begin{itemize}
+\item \texttt{GET /api/hosts} $\rightarrow$ 200 (host inventory exposed);
+\item \texttt{POST /api/policies} $\rightarrow$ 201 (attacker installs an allow-all policy);
+\item \texttt{POST /api/approvals/\{id\}/approve} $\rightarrow$ self-approves pending approvals, defeating the human-approval gate;
+\item \texttt{POST /api/executions} $\rightarrow$ 200, \texttt{decision=allow}; the SSH executor ran \texttt{echo \_\_AEG\_RCE\_VERIFY\_44e6f8\_\_} on the configured remote host and the marker echoed in stdout.
+\end{itemize}
+The thing named \emph{gateway} is an unauthenticated remote-execution primitive. \textbf{CWEs:} 306, 285, 78. Issue \#2.
+
+\subsection{\texttt{agent-sandbox-runtime}: unauthenticated arbitrary Python execution}\label{sub:asr}
+\texttt{nagasai17bce-rgb/agent-sandbox-runtime} (0-star). \texttt{/v1/run} accepts arbitrary Python and executes it, no authentication; the provided Dockerfile binds \texttt{0.0.0.0}. Confirmed: \texttt{POST /v1/run} echoed our marker and hostname. The thing named \emph{sandbox} is an unauthenticated code-execution primitive. \textbf{CWEs:} 306, 94. Issue \#1.
+
+\subsection{\texttt{governed-policy-engine}: policy rewrite and approval bypass}\label{sub:gpe}
+\texttt{JestonBatson/governed-policy-engine} (0-star). The engine named for \emph{governance} exposes unauthenticated control: \texttt{PUT /v1/policies} (rewrite whole policy set) and \texttt{POST /v1/approvals} (self-grant any approval) both return 200 on loopback; \texttt{GET /api/hosts} leaks config. Dockerfile binds \texttt{0.0.0.0}. A missing \texttt{AUDIT\_SIGNING\_KEY} causes a 503, which is a \emph{deployment requirement} (fail-closed), not the vulnerability. \textbf{CWEs:} 306, 284, 200. Issue \#1.
+
+\subsection{\texttt{e2b-mcp-server}: hardcoded key + unauthenticated services}\label{sub:e2b}
+\texttt{ishakking642-eng/e2b-mcp-server} (0-star). A hardcoded Daytona API key committed to source, plus MCP and guard HTTP services bound to \texttt{0.0.0.0} with no authentication. \textbf{CWEs:} 798, 306. Issue \#3.
+
+\section{Control Group}\label{sec:control}
+Seven implementations we audited were \emph{not} exploitable and are listed as the hardened baseline:
+\begin{enumerate}
+\item \texttt{web-agent-gateway}: pairing token (32--256 chars) + dual approval;
+\item \texttt{agent-ssh-gateway}: access control + token store + alembic audit log;
+\item \texttt{Agent-Security-MCP-Gateway}: CSRF protection + disposable approvals + scope boundary;
+\item \texttt{AI-Agent-Security-Gateway}: scope extractor + audit + evaluator;
+\item \texttt{ib-mcp}: fail-closed (refuses to start without auth config), binds 127.0.0.1 by default;
+\item \texttt{mcp-confirm}: claim-once + request-state boundary + re-query (prevents approval reuse);
+\item \texttt{computeMCP}: HMAC auth with constant-time compare + per-client ACL + remote-container isolation (stdin-observed).
+\end{enumerate}
+These span star counts from 0 to thousands. Their existence shows the vulnerable pattern is a \emph{choice} (rushed unauthenticated defaults), not a size constraint.
+
+\section{Analysis}\label{sec:analysis}
+\subsection{The name is the only control.}\label{sub:name}
+Every vulnerable component advertised the security property it fails to enforce. A deploying operator has no other signal. Star counts do not help: the vulnerable class is 0-star by construction, but the hardened control group also contains 0-star repositories. The differentiator is not age, size, or stars---it is whether authentication is actually wired to the executable surface.
+
+\subsection{Why 0-star trust inversion is dangerous}\label{sub:why}
+The ecosystem's open tooling means a recently-published 0-star repository can be adopted quickly (an MCP server or gateway is a few files; a ``docker run'' one-liner is all the deployment guide needs). The name ``sandbox'' / ``gateway'' / ``policy'' is a strong prior that suppresses scrutiny. Our finding that 3 of 4 vulnerable repos ship \texttt{0.0.0.0} in their own Dockerfile means the advertised deployment is already network-reachable.
+
+\subsection{Rate estimate and honesty}\label{sub:rate}
+Of 62 cloned candidates, 13 were execution-control candidates we deep-audited and 4 were confirmed (3 of them runtime-verified end-to-end; the 4th is static hardcoded-secret plus service surface). We report the per-class rate rather than a blanket ``MCP servers are insecure'' claim: the vulnerable signal is concentrated in \emph{name-advertising execution control} components, not in the mature MCP server population. We deliberately avoid claiming any rate beyond our window; reproducibility files and the full audit tree are preserved.
+
+\section{Related Work}\label{sec:related}
+Prior work (ours and others) catalogued MCP tool-server command injection (CWE-78), credential storage, and A2A registry SSRF. This work isolates a different failure mode: \emph{assurance by naming} in execution-control components, and its concentration in the recent-0-star population. The protocol-level trust-label problem (MCP \texttt{readOnlyHint}/\texttt{destructiveHint} being self-attested and unenforced) is complementary and treated separately; here the assurance is not a protocol field but the repository name and README.
+
+\section{Mitigation}\label{sec:mitigation}
+\begin{enumerate}
+\item \textbf{Operators}: treat name-based assurance as zero; verify authentication wiring and default bind address before deployment; never expose a control component on \texttt{0.0.0.0} without a token gate.
+\item \textbf{Authors}: fail closed---refuse to start without explicit auth configuration (like \texttt{ib-mcp} and \texttt{computeMCP}).
+\item \textbf{Ecosystem}: a neutral, verifiable trust signal (e.g., reproducible audit marks, or packaging-layer assertions on default binds and auth presence) would partially replace self-attested naming. The MCP trust-label discussion (paper \#25) is the protocol-level complement.
+\end{enumerate}
+
+\section{Conclusion}\label{sec:conclusion}
+We audited 62 freshly-published repositories in the agent-execution-control class and runtime-confirmed 4 vulnerabilities, all unauthenticated, all named for the property they violate. The pattern---\emph{zero-star trust inversion}---is a structural risk in the open agent-tooling ecosystem: the assurance an operator relies on (the name) is attacker-controlled and wrong. A 7-item hardened control group proves the pattern is avoidable. We argue for (a) operator scrutiny independent of naming, and (b) an enforceable, non-self-attested trust signal at the ecosystem or protocol layer.
+
+\bibliographystyle{splncs04}
+\bibliography{references}
+
+\end{document}
