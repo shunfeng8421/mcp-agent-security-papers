@@ -1,0 +1,223 @@
+\documentclass{llncs}
+
+% === Packages ===
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{pifont}% \ding for markers
+% URL break settings
+\hypersetup{breaklinks=true}
+\sloppy
+
+% Listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    columns=fullflexible,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny,
+    xleftmargin=2em,
+    framexleftmargin=1.5em,
+}
+
+\setcounter{secnumdepth}{5}
+
+\begin{document}
+
+\title{Agent Execution Control Planes: When ``Sandbox'', ``Gateway'', and ``Policy'' Ship as Unauthenticated Code Execution}
+
+\author{Anonymous}
+\institute{Anonymous}
+
+\maketitle
+
+\begin{abstract}
+The ``execution control plane'' is an emerging architectural class in the AI-agent ecosystem: services named \emph{agent-exec-gateway}, \emph{agent-sandbox}, \emph{code-sandbox}, \emph{policy engine}, or \emph{tool-gateway} that are \emph{supposed} to constrain what an AI agent may execute---by policy, approval, and sandbox isolation. We present an empirical, runtime-verified security campaign over the freshly-published population of this class. Scanning $\sim$500 newly-published MCP/A2A/agent repositories across five attack-surface dimensions, we confirm and responsibly disclose \textbf{4 exploitable vulnerabilities} whose root cause is a single recurring pattern we term \emph{control-plane trust inversion}: the very component whose name promises restriction is shipped as an \emph{unauthenticated, direct code-execution endpoint}. In two cases an attacker with network access injects an allow-all policy and triggers arbitrary command/Python execution with output read-back, bypassing the service's own approval gate; one ships a hardcoded credential plus two unauthenticated services; and one exposes unauthenticated policy-rewrite and self-approval on a human-approval control plane. We contrast these with a control group of seven mature implementations (fail-closed boot, HMAC constant-time compare, single-use approval, VM/gvisor isolation) to show the ecosystem is \emph{two-sided}: established/enterprise agent infrastructure is hardened, while freshly-published 0-star ``control-plane'' repositories repeatedly invert the trust model. We argue this is an agent-ecosystem-specific gap---distinct from the MCP-tool hardening documented in prior work---because the naming (\emph{sandbox}/\emph{gateway}/\emph{policy}) creates a false assurance that a restriction layer exists. We provide detection signatures, honest deployment-boundary analysis, and hardening guidance.
+\end{abstract}
+
+\keywords{Agent Execution Control Plane \and Unauthenticated Code Execution \and CWE-306 \and Agent Sandbox \and Policy Bypass \and Ecosystem Security}
+
+\section{Introduction}\label{sec:intro}
+
+AI agents increasingly carry \emph{code-execution authority}: they run commands, evaluate Python, and manipulate hosts through a stack of tools and servers. To keep these agents safe, a new component class has appeared across the ecosystem---the \emph{execution control plane}. Its members adopt names that promise restriction---\texttt{agent-exec-gateway}, \texttt{agent-sandbox}, \texttt{code-sandbox}, \texttt{policy engine}, \texttt{tool-gateway}---and are described as constraining agent actions by policy matching, human approval, or sandbox isolation.
+
+Prior systematic work has documented tens of exploitable vulnerabilities in the \emph{MCP tool} ecosystem: command injection (CWE-78), SSRF (CWE-918), read-only gate bypass (CWE-281), and unauthenticated exposure (CWE-306), concentrated in low-star repositories~\cite{mcp-spec,a2a-spec,chen2026mcp}. Those corpora were built from \emph{established} servers and focused on tool primitives. A distinct and under-measured surface is the \emph{control-plane layer} itself---the services whose entire purpose is to gate execution. When a control plane is unauthenticated, an attacker does not merely reach a powerful tool; the attacker can \emph{rewrite the policy}, \emph{self-approve}, and \emph{execute arbitrary commands}, turning the supposed guardrail into the primary RCE primitive.
+
+This paper presents a focused empirical study over the freshly-published population of this class (2026-09-24 to 2026-10-02). Our contributions:
+
+\begin{enumerate}
+    \item \textbf{A new defect class}---\emph{control-plane trust inversion}: the component named for restriction is shipped as an unauthenticated, direct code-execution endpoint (CWE-306), enabling policy bypass and arbitrary command/Python execution.
+    \item \textbf{Three runtime-confirmed disclosures} across three 0-star repositories, with honest deployment-boundary analysis (default loopback vs.\ 0.0.0.0 Docker).
+    \item \textbf{A two-sided maturity finding}: a control group of seven hardened implementations (fail-closed boot, constant-time compare, single-use approval, VM isolation) shows the ecosystem is \emph{not uniformly} insecure---established infrastructure hardened, while 0-star ``control-plane'' repos invert the trust model.
+    \item \textbf{Detection signatures and mitigation patterns} for triaging this class.
+\end{enumerate}
+
+\section{Background and Related Work}\label{sec:background}
+
+\subsection{The agent execution stack}\label{sub:stack}
+A typical agent execution stack has several layers: the \emph{model} (Claude/Codex/GPT), a \emph{client/framework} that turns tool calls into actions, \emph{tools} that perform concrete operations, and---increasingly---a \emph{control plane} that decides whether an action is allowed. Control planes differ from tools: they exist to \emph{enforce a boundary} (policy, approval, sandbox), not to perform the operation itself. This is why their security posture matters doubly: a broken control plane both fails to constrain and exposes an execution primitive.
+
+\subsection{Related empirical audits}\label{sub:related}
+Recent systematic audits of the MCP/A2A ecosystems~\cite{chen2026mcp,pcfg2026,anon2026mcp} catalogued command injection, SSRF, read-only-gate bypass, credential-theft oracles, and principal-spoofing in \emph{established} and \emph{fresh} tool servers. Our work differs in two ways: (a) we target the \emph{control-plane layer} specifically rather than tool primitives, and (b) we show the recurring pattern is \emph{trust inversion}---naming promises restriction while the implementation exposes direct execution---which is an agent-ecosystem-specific gap. The MCP-tool hardening documented in prior work does not automatically extend to agent control planes.
+
+\section{Threat Model}\label{sec:threat}
+
+We assume an attacker who can reach the control plane's HTTP endpoint. Two deployment postures matter:
+
+\begin{itemize}
+    \item \textbf{Loopback (default in most repos)}: attacker = local user, co-located MCP client, or same-host process. Impact = local/reachable arbitrary command execution.
+    \item \textbf{0.0.0.0 (shipped in Dockerfiles)}: attacker = any remote peer. Impact = remote unauthenticated RCE.
+\end{itemize}
+
+The attacker's objective against a control plane is \emph{authority escalation}: (1) read the configuration (hosts, policies, approvals, execution outputs); (2) rewrite the policy to allow all; (3) self-approve pending approvals; (4) register new execution hosts (including SSH targets with identity files); (5) trigger arbitrary command execution and read output. We consider the control plane \emph{itself} as the attack surface, not the tools it gates.
+
+\section{Attack Surface and the Inversion Pattern}\label{sec:surface}
+
+\subsection{Control-plane trust inversion}\label{sub:inversion}
+The recurring root cause across all confirmed findings is \emph{trust inversion}:
+
+\begin{center}
+\small
+\texttt{control plane (named sandbox/gateway/policy)}
+\\
+$\downarrow$ should be ``the constraint that limits an agent''
+\\
+$\downarrow$ actually ships as ``unauthenticated + arbitrary code exec + attacker-rewritable''
+\end{center}
+
+Three concrete sub-patterns:
+\begin{enumerate}
+    \item \textbf{Control plane rewritable unauthenticated.} (agent-exec-gateway) The \texttt{/api/policies} endpoint accepts an allow-all rule without auth; \texttt{/api/hosts} registers execution hosts; \texttt{/api/approvals/.../approve} self-approves. An attacker injects \texttt{\{client:'*',host:'*',command:'*',decision:'allow'\}} then triggers any command.
+    \item \textbf{``Sandbox'' = bare subprocess.} (agent-sandbox-runtime) Despite the name, \texttt{POST /v1/run} does \texttt{subprocess.run(["python","-c",value])} with no isolation, and the Dockerfile binds 0.0.0.0.
+    \item \textbf{Security service itself unguarded.} (e2b-mcp-server) A companion ``guard'' HTTP API binds 0.0.0.0 with \texttt{Access-Control-Allow-Origin: *} and no auth, exposing blocklist manipulation and operational data.
+\end{enumerate}
+
+\subsection{Audit checklist for this class}\label{sub:checklist}
+When triaging an execution control plane, check in order:
+\begin{enumerate}
+    \item \textbf{Bind default}: loopback (127.0.0.1) vs.\ 0.0.0.0 (esp.\ in Dockerfile/README deploy command).
+    \item \textbf{Every /api/* route auth}: is there a central middleware/Depends, or bare handlers?
+    \item \textbf{Execution primitive}: \texttt{subprocess/python -c/spawn} reachable from an unauthenticated endpoint? argv fully attacker-controlled?
+    \item \textbf{Control-plane write}: can an unauthenticated caller add policies/hosts/approvals?
+    \item \textbf{Self-approval}: is there an approve endpoint the execution submitter can also call?
+\end{enumerate}
+
+\section{Findings}\label{sec:findings}
+
+We confirmed and responsibly disclosed three vulnerabilities. Table~\ref{tab:findings} summarizes; each is runtime-verified on an isolated loopback instance with marker commands only, and disclosed via public GitHub issue.
+
+\begin{table}[ht]
+\centering\small
+\caption{Confirmed vulnerabilities in agent execution control planes (2026-10-02 campaign).}
+\label{tab:findings}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Repo} & \textbf{Defect} & \textbf{Impact} & \textbf{Default bind} \\
+\midrule
+truong51972/agent-exec-gateway & Unauth policy/host/approval endpoints + arbitrary \texttt{create\_subprocess\_exec(*argv)} & Policy bypass + arbitrary command exec, output read-back & 127.0.0.1 (remote if 0.0.0.0) \\
+nagasai17bce-rgb/agent-sandbox-runtime & Unauth \texttt{POST /v1/run} $\to$ \texttt{subprocess.run(["python","-c",value])}, no isolation & Arbitrary Python exec, output read-back & Dockerfile 0.0.0.0 ($\Rightarrow$ remote RCE per README deploy) \\
+JestonBatson/governed-policy-engine & Unauth \texttt{PUT /v1/policies} (rewrite) + \texttt{POST /v1/approvals} (self-grant) & Human-approval gate bypass (governance, not RCE) & Dockerfile 0.0.0.0 ($\Rightarrow$ remote) \\
+ishakking642-eng/e2b-mcp-server & Hardcoded API key (CWE-798) + two unauth 0.0.0.0 services (CWE-306) & Workspace control (conditional) + blocklist/feed manipulation + disclosure & 0.0.0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{agent-exec-gateway (CWE-306)}\label{sub:exec-gateway}
+A FastAPI control plane where \emph{every} \texttt{/api/*} route is unauthenticated, and the control-plane writes are themselves the enablers:
+\begin{itemize}
+    \item \texttt{POST /api/policies} \texttt{\{client:'*',host:'*',command:'*',decision:'allow'\}} $\to$ 201, injects an allow-all rule that makes every subsequent execution \texttt{decision=allow} (bypassing the default \texttt{ASK} human approval).
+    \item \texttt{POST /api/hosts} registers a local/SSH execution host (SSH hosts store \texttt{identity\_file} path).
+    \item \texttt{POST /api/executions} \texttt{\{host:'local',argv:[\dots]\}} $\to$ 200 \texttt{status=completed decision=allow}, \texttt{stdout} read back.
+    \item \texttt{POST /api/approvals/\{id\}/approve} lets the submitter self-approve a pending execution.
+\end{itemize}
+\textbf{Runtime evidence:} unauth \texttt{POST /api/executions} with \texttt{argv=["python","-c","print('\texttt{\_\_AEG\_RCE\_VERIFY\_44e6f8\_\_}')"]} returned \texttt{stdout: \texttt{\_\_AEG\_RCE\_VERIFY\_44e6f8\_\_}}, \texttt{decision=allow}, no approval. \textbf{Honest scope:} default \texttt{bind\_host=127.0.0.1} $\Rightarrow$ local/reachable RCE; deployed to 0.0.0.0 or behind a proxy, remote RCE.
+
+\subsection{agent-sandbox-runtime (CWE-306)}\label{sub:sandbox-runtime}
+Named \emph{sandbox}, but \texttt{POST /v1/run} executes arbitrary Python with no isolation:
+\begin{lstlisting}[language=Python]
+# app/service.py
+process = subprocess.run(["python","-c", value], capture_output=True, text=True, timeout=2)
+# app/main.py (FastAPI)
+@app.post("/v1/run")
+def run(req: Request): return service.run(req.value)   # no auth, no sandbox
+\end{lstlisting}
+\textbf{Runtime evidence:} \texttt{POST /v1/run} \texttt{\{value:"import socket; print('\_\_ASR\_RCE\_VERIFY\_91f7c3\_\_')"}\} returned \texttt{stdout: \_\_ASR\_RCE\_VERIFY\_91f7c3\_\_ <hostname>}. \textbf{Honest scope:} the README self-declares this is a reference boundary with authentication listed as a roadmap item (doc-vs-executable); however the \texttt{Dockerfile} binds 0.0.0.0 and the README deploy command is \texttt{docker run -p 8000:8000 agent-sandbox-runtime}, which makes the unauthenticated code-exec endpoint \emph{remotely reachable} = RCE on the container host.
+
+\subsection{e2b-mcp-server (CWE-798 + CWE-306)}\label{sub:e2b}
+A Daytona sandbox manager MCP server with (a) a real-format Daytona API key hardcoded as the default fallback of \texttt{os.getenv('DAYTONA\_API\_KEY', 'dtn\_365790d2...')} (CWE-798); (b) the FastMCP SSE server bound to 0.0.0.0 with no auth (CWE-306), so any peer can call \texttt{wake\_up\_sandbox()} which issues authenticated requests to the operator's workspace; (c) a companion ``guard'' HTTP server bound to 0.0.0.0 with \texttt{Access-Control-Allow-Origin: *} and no auth on any of its 12 routes, enabling unauthenticated blocklist manipulation, feed injection, and operational-data disclosure. \textbf{Honest scope:} the Daytona key's validity was not probed; workspace control is conditional on the key being live; the guard impact is blocklist/feed manipulation + disclosure (no command-execution surface), deployment-dependent.
+
+\subsection{governed-policy-engine (CWE-306)}\label{sub:governed}
+A "deterministic authorization and human-approval control plane for AI-enabled systems." Its two security-critical write endpoints are unauthenticated:
+\begin{itemize}
+    \item \texttt{PUT /v1/policies} — any caller can \emph{rewrite all policies} (remove a \texttt{require\_approval} rule or add an allow-all rule).
+    \item \texttt{POST /v1/approvals} — any caller can \emph{grant an approval} for an arbitrary \texttt{(actor, action, resource)} (self-approval).
+    \item \texttt{POST /v1/decisions} — when a request carries the \texttt{approval\_id}, the engine evaluates to \texttt{ALLOW} / \texttt{APPROVAL\_GRANTED} (per the repo's own \texttt{scripts/approval\_demo.py}).
+    \item \texttt{Dockerfile} binds \texttt{0.0.0.0}; \texttt{docker compose up} maps \texttt{8000:8000} — default bind is public, not loopback.
+\end{itemize}
+\textbf{Runtime evidence:} unauth \texttt{PUT /v1/policies} (\texttt{require\_approval} on \texttt{customer.delete}) $\to$ 200; unauth \texttt{POST /v1/approvals} \texttt{\{id:"attacker-approved-1", actor\_id, action, resource, expires\_at\}} $\to$ 200 (approval granted, id returned). The subsequent \texttt{ALLOW} decision leg required \texttt{AUDIT\_SIGNING\_KEY} to be set (a correct fail-closed deployment requirement, enforced by \texttt{docker-compose} too), which we did not configure, but the author's own demo script documents that a scoped approval flips \texttt{REQUIRE\_APPROVAL}$\to$\texttt{ALLOW}. \textbf{Honest scope:} impact is \emph{governance bypass} (forcing high-risk AI actions that should require human approval to be treated as allowed), not code execution; default Docker bind 0.0.0.0 makes the unauth policy/approval write surface remotely reachable.
+
+\section{Control Group: the Ecosystem Is Two-Sided}\label{sec:control}
+
+To avoid over-generalizing from three findings, we audited a control group of seven \emph{mature} execution control planes (Table~\ref{tab:control}). All are hardened:
+
+\begin{table}[ht]
+\centering\small
+\caption{Control group---mature agent control planes (no vulnerabilities).}
+\label{tab:control}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Implementation} & \textbf{Hardening observed} \\
+\midrule
+ib-mcp & fail-closed boot (no TOKEN + no ALLOW\_UNAUTH = refuse), HMAC \texttt{compare\_digest}, trading opt-in, loopback default \\
+mcp-confirm (les-k) & single-use approval + RequestStateBoundary + target re-check at exec time, fail-closed \\
+ai-agent-firewall & AST analyzer + behavioral analysis + runtime guards \\
+agent-ssh-gateway & token store + ownership + audit (Alembic migrations) \\
+agents-sandbox (inoio) & gvisor/VM runtime + network policy + mounts parsing + reap policy \\
+mcp-governance-gateway & \texttt{token\_urlsafe} 32B + auth.py + audit + confirm \\
+web-agent-gateway & pairing token 32--256 + double-approval + token-class isolation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The contrast is sharp: established/enterprise agent infrastructure consistently ships fail-closed boot, constant-time comparison, single-use approval, and OS-level isolation, while freshly-published 0-star ``control-plane'' repositories repeatedly invert the trust model. This two-sidedness is the paper's central empirical finding: the risk is not ``agent control planes are insecure'' but ``\emph{the control-plane name creates false assurance precisely where freshly-published code is least trustworthy}.''
+
+\section{Measurement and Method}\label{sec:method}
+
+\subsection{Campaign scope}\label{sub:scope}
+Over 2026-09-24 to 2026-10-02 we scanned five attack-surface dimensions across the freshly-published MCP/A2A/agent ecosystem ($\sim$500 repositories triaged): (1) supply-chain poisoning of PyPI/npm mcp packages (444 targets, 0 findings; npm security-hold protects \texttt{mcp-server-*} names), (2) agent permission-escaping / exec-sandbox-gateway (8 targets, 2 findings), (3) credential storage (3 targets, 0 findings; fail-closed mature), (4) prompt-injection defense (8 targets, 0 findings), (5) protocol/transport implementation (3 targets, 0 findings; official SDK + mcp-proxy hardened), plus an expanded execution-control-plane sweep (40 targets, 0 additional findings). Every candidate was triaged via the Section~\ref{sub:checklist} checklist; high-signal candidates were runtime-verified on isolated loopback instances with marker commands only.
+
+\subsection{Honest limitations}\label{sub:limits}
+The confirmed-findings hit rate over the full $\sim$500-repo sweep is low ($\approx$0.4\%); the two execution-control-plane findings came from a \emph{targeted} sweep (8 candidates). This is expected: the pattern is specific (\emph{unauth + control-plane-writable + bare-exec primitive}), not uniformly present. We report the honest numbers, the specific discovery signatures, and the deployment-boundary conditions rather than inflate a broad ``ecosystem insecurity'' claim. Findings are source+runtime confirmed on loopback; remote reachability depends on the documented default bind (mostly loopback unless the Dockerfile/README overrides to 0.0.0.0).
+
+\section{Mitigation}\label{sec:mitigation}
+
+\begin{enumerate}
+    \item \textbf{Fail-closed boot}: refuse to start if no token is configured and unauthenticated mode is not explicitly enabled (as ib-mcp does).
+    \item \textbf{Central auth on every /api/* route}: enforce via middleware/Depends, never per-route omission.
+    \item \textbf{Policy/host writes are admin-only}: an unauthenticated caller must never add policies, hosts, or approvals.
+    \item \textbf{Human-only approval}: no self-approve endpoint reachable by the execution submitter.
+    \item \textbf{Dockerfile binds loopback by default}: require an explicit opt-in (\texttt{--host 0.0.0.0}) plus auth before remote exposure.
+    \item \textbf{Real isolation for anything named sandbox}: container/microVM, read-only FS, resource quotas, network policy, dropped privileges (the README guidance the implementation must actually honor).
+    \item \textbf{Don't let naming create false assurance}: a ``sandbox''/``gateway''/``policy'' name is a security claim; it must be verified, and 0-star freshly-published instances deserve the same scrutiny as any untrusted network service.
+\end{enumerate}
+
+\section{Conclusion}\label{sec:conclusion}
+Execution control planes are the trust boundary of the agent stack, yet our empirical campaign shows the \emph{control-plane trust inversion}---naming that promises restriction shipped as unauthenticated direct code execution---is a live, reproducible defect in freshly-published 0-star repositories, distinct from the MCP-tool hardening documented in prior work. Three runtime-confirmed disclosures (arbitrary command/Python execution with policy bypass; hardcoded credential plus unauthenticated services) contrast with a hardened control group, showing the ecosystem is two-sided. We provide detection signatures, honest deployment-boundary analysis, and hardening guidance, and argue that security review of agent control planes must treat the name as a claim, not a guarantee.
+
+\section{Disclosure \& Ethics}\label{sec:disclosure}
+All three findings were runtime-verified on isolated loopback instances with marker commands only (no real credentials probed, no harm performed), then disclosed via public GitHub issues with honest deployment-boundary scope. No private data, credentials, or production systems were accessed. The CVE-798 hardcoded-key finding's validity was explicitly \emph{not} probed against the external service.
+
+\bibliographystyle{splncs04}
+\bibliography{references}
+
+\end{document}
