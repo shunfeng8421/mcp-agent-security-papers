@@ -32,5 +32,9 @@ Runtime-verified security research on the MCP (Model Context Protocol) and AI-ag
 ## Methodology
 All vulnerabilities are **runtime-confirmed** against real, isolated server instances (loopback, no credentials, no real assets). Confidence stated honestly; deployment-dependent impacts flagged, never exaggerated.
 
+## Companion toolkit
+
+Detection tools behind these findings (read-only gate, SSRF, command injection, trust-label spoof) are open-sourced in **[shunfeng8421/mcp-security-toolkit](https://github.com/shunfeng8421/mcp-security-toolkit)**.
+
 ## Cite
 See `CITATION.cff`. License CC-BY-4.0.
