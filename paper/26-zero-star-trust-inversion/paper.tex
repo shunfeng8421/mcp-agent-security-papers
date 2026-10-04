@@ -115,8 +115,17 @@ The ecosystem's open tooling means a recently-published 0-star repository can be
 \subsection{Rate estimate and honesty}\label{sub:rate}
 Of 62 cloned candidates, 13 were execution-control candidates we deep-audited and 4 were confirmed (3 of them runtime-verified end-to-end; the 4th is static hardcoded-secret plus service surface). We report the per-class rate rather than a blanket ``MCP servers are insecure'' claim: the vulnerable signal is concentrated in \emph{name-advertising execution control} components, not in the mature MCP server population. We deliberately avoid claiming any rate beyond our window; reproducibility files and the full audit tree are preserved.
 
-\section{Related Work}\label{sec:related}
+\subsection{Language and engineering culture as a vulnerability predictor}\label{sub:lang}
+The vulnerable signal also tracks language and engineering culture, not just naming. In the same audit window, we deep-audited 8 Rust/Go MCP servers (skgate OAuth gateway, fastexec-mcp bash tool, esxi-mcp, pydeno V8 sandbox, and four others) and found \emph{zero} exploitable vulnerabilities. The difference is structural:
+\begin{itemize}
+\item Rust/Go statically type the command boundary: execution uses `Command::new(...).args(...)` argv lists, never shell parsing, so f-string/shell injection is hard to write.
+\item Authentication is taken seriously: skgate implements textbook OAuth (PKCE S256, single-use codes, constant-time comparison, strict redirect validation); no equivalent Python 0-star gateway did.
+\item Engineering culture: SECURITY.md, CI and acceptance tests are common in Rust/Go MCP repos.
+\end{itemize}
+Python's fast-prototyping style (FastAPI without `Depends`, `shell=True`, hardcoded secrets, `0.0.0.0` Docker binds) is where the density is: 4 of our 4 confirmed vulnerabilities are Python. We also deep-audited two new AI-agent$\times$DeFi wallets (an ERC-4337 smart account with whitelisted targets / session limits / circuit breaker, and a bounded-execution contract) and found them hardened against easy exploits. The practical conclusion for defenders: among freshly-published control-plane components, \emph{Python 0-star is the highest-signal audit target}, and a repository named for security in Rust/Go is far more likely to deliver it than an identically-named Python one.
 Prior work (ours and others) catalogued MCP tool-server command injection (CWE-78), credential storage, and A2A registry SSRF. This work isolates a different failure mode: \emph{assurance by naming} in execution-control components, and its concentration in the recent-0-star population. The protocol-level trust-label problem (MCP \texttt{readOnlyHint}/\texttt{destructiveHint} being self-attested and unenforced) is complementary and treated separately; here the assurance is not a protocol field but the repository name and README.
+
+\section{Related Work}\label{sec:related}
 
 \section{Mitigation}\label{sec:mitigation}
 \begin{enumerate}
