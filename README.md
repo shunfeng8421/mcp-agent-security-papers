@@ -36,5 +36,8 @@ All vulnerabilities are **runtime-confirmed** against real, isolated server inst
 
 Detection tools behind these findings (read-only gate, SSRF, command injection, trust-label spoof) are open-sourced in **[shunfeng8421/mcp-security-toolkit](https://github.com/shunfeng8421/mcp-security-toolkit)**.
 
+## Essays
+- **Two Sides of the Same Factory** — what designing proteins and hunting MCP bugs taught me about trust (`essays/`)
+
 ## Cite
 See `CITATION.cff`. License CC-BY-4.0.
